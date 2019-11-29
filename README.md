@@ -16,8 +16,21 @@ Libraries (produced and) used:
 ## Coegi Mobile (Android/iOS)
 * Mobile Application for Android/iOS
 
-### Prerequisites
-* Choose a multi-platform framework which supports calling Rust in the background service
+### Multi-platform framework evaluation
+* Requirements
+  1. iOS and Android
+  2. background services
+  3. Rust code in background service
+* Optional
+  4. Share UI code for all platforms
+
+#### Compare UI design and devlepment for Flutter/Dart and Kotlin/Multiplatform
+In a Kotlin-Multiplatform project, do you need to write the UI separately for each platform?
+* According to [this blog](https://goobar.io/2019/06/13/kotlin-vs-flutter-are-you-comparing-them-fairly/) the answer is yes.
+
+Because we want as much code shared as possible, we'd opt for Flutter.
+
+#### React Native
 
 ### v0.1
 * Multi-platform App with background service which links to Rust library
