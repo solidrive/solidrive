@@ -198,8 +198,6 @@ pub mod webid_oidc {
         use super::*;
 
         fn spawn_callback_server(bind_addr: String) -> Fallible<std::sync::mpsc::Receiver<String>> {
-            // spawn a callback server for this
-
             use actix_web::{web, App, HttpServer, Responder};
 
             let (tx_server, rx_server) = std::sync::mpsc::channel();
