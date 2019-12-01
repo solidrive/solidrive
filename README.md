@@ -24,7 +24,6 @@ Libraries (produced and) used:
 
 ### v0.2
 * Login/Authentication
-* Authentication
 * List
 * View (download to memory)
 
