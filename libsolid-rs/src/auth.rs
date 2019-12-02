@@ -1,222 +1,178 @@
 /// This module implements the WebID-OIDC protocol
 pub mod webid_oidc {
     use failure::{bail, Fallible, ResultExt};
-    use openidconnect::core::{CoreClientRegistrationRequest, CoreProviderMetadata};
+    use openidconnect::core::{
+        CoreClient, CoreClientRegistrationRequest, CoreProviderMetadata, CoreResponseType,
+    };
     use openidconnect::registration::EmptyAdditionalClientMetadata;
     use openidconnect::reqwest::http_client;
-    use openidconnect::{AccessToken, ClientId, ClientSecret, IssuerUrl, RegistrationUrl};
+    use openidconnect::{
+        AccessToken, AccessTokenHash, AuthenticationFlow, AuthorizationCode, ClientId,
+        ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+        RegistrationUrl, Scope, TokenResponse,
+    };
+
+    use std::collections::{HashMap, HashSet};
 
     type Result<T> = Fallible<T>;
 
-    /// Request the OpenID discovery document from the given URL
-    fn discover(provider_url: String) -> Result<CoreProviderMetadata> {
-        Ok(
-            CoreProviderMetadata::discover(&IssuerUrl::new(provider_url)?, http_client)
-                .context("provider metadata discovery")?,
-        )
+    pub type ProviderID = String;
+
+    pub type ProviderMetadata = CoreProviderMetadata;
+
+    pub struct Provider {
+        id: ProviderID,
+        metadata: ProviderMetadata,
     }
 
-    /// Register with the given provider
-    pub fn register(provider_url: String, redirect_urls: Vec<String>) -> Result<(String, String)> {
-        let registration = CoreClientRegistrationRequest::new(
-            redirect_urls
-                .into_iter()
-                .map(|redirect_url| openidconnect::RedirectUrl::new(redirect_url).unwrap())
-                .collect(),
-            EmptyAdditionalClientMetadata::default(),
-        );
-
-        // TODO: think about getting this via the arguments instead of discovering
-        let provider_metadata = discover(provider_url.clone()).context("discover for register")?;
-
-        let registration_url = provider_metadata
-            .registration_endpoint()
-            .unwrap()
-            .to_string();
-
-        let response = registration
-            .register(
-                &RegistrationUrl::new(registration_url.clone()).context("new registration url")?,
-                http_client,
-            )
-            .context(format!("registration at {}", &registration_url))?;
-
-        Ok((
-            response.client_id().as_str().to_string(),
-            response.client_secret().unwrap().secret().to_string(),
-        ))
+    pub struct RegistrationCredentials {
+        client_id: String,
+        client_secret: String,
     }
 
-    /// These paramters are passed to the `login` function
-    pub struct LoginOptions {
-        pub(crate) issuer_url: String,
-        pub(crate) callback_uri: String,
-        pub(crate) client_id: String,
-        pub(crate) client_secret: String,
-        pub(crate) rx_query_params: std::sync::mpsc::Receiver<String>,
-        pub(crate) scopes: Vec<String>,
+    pub struct Registration {
+        provider: Provider,
+        credentials: RegistrationCredentials,
+
+        // TODO: verify if (and why) we need to store this
+        redirect_url: String,
     }
 
-    /// Perform a [WebID-OIDC][spec] authentication code flow and return the access token and the WebID URI
-    ///
-    /// An example workflow [is described in the web-oidc-spec repository][example-workflow].
-    ///
-    /// [spec]: https://github.com/solid/webid-oidc-spec/blob/0e6da67a624a4d09ab85e28bafe85da33f860a61/README.md
-    /// [example-workflow]: https://github.com/solid/webid-oidc-spec/blob/master/example-workflow.md
-    pub fn login(options: LoginOptions) -> Result<AccessToken> {
-        use openidconnect::core::{CoreClient, CoreResponseType};
-        use openidconnect::{
-            AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce,
-            PkceCodeChallenge, RedirectUrl, Scope,
-        };
-        use openidconnect::{OAuth2TokenResponse, TokenResponse};
+    pub type WebID = String;
 
-        let provider_metadata = discover(options.issuer_url).context("discover for login")?;
+    pub struct AccessCredentials {
+        access_token: AccessToken,
+        id_token_claims: openidconnect::IdTokenClaims<
+            openidconnect::EmptyAdditionalClaims,
+            openidconnect::core::CoreGenderClaim,
+        >,
+        authorized_scopes: Option<HashSet<Scope>>,
+    }
 
-        // Create an OpenID Connect client by specifying the client ID, client secret, authorization URL
-        // and token URL.
-        let client = CoreClient::from_provider_metadata(
-            provider_metadata,
-            ClientId::new(options.client_id),
-            Some(ClientSecret::new(options.client_secret)),
-        )
-        // Set the URL the user will be redirected to after the authorization process.
-        .set_redirect_uri(RedirectUrl::new(options.callback_uri).context("setting redirect url")?);
-
-        // Generate a PKCE challenge.
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        // Generate the full authorization URL.
-        let (auth_url, csrf_token, nonce) = {
-            let mut authorizan_request = client
-                .authorize_url(
-                    AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
-                    CsrfToken::new_random,
-                    // TODO: figure out what to do with the nonce
-                    Nonce::new_random,
-                )
-                .set_pkce_challenge(pkce_challenge);
-
-            // Set the desired scopes.
-            for scope in options.scopes {
-                authorizan_request = authorizan_request.add_scope(Scope::new(scope.to_string()));
-            }
-
-            authorizan_request.url()
-        };
-
-        // This is the URL you should redirect the user to, in order to trigger the authorization
-        // process.
-        println!("Please browse to: {}", auth_url);
-
-        // Once the user has authorized the request, we'll receive the query parameters from the background server
-        let query_params = options
-            .rx_query_params
-            .recv()
-            .context("receiving query_params")?;
-        println!("received query_string");
-
-        let params =
-            actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(
-                &query_params,
-            )
-            .unwrap()
-            .into_inner();
-
-        // For security reasons, verify that the `state` parameter returned by the server matches `csrf_state`
-        match params.get("state") {
-            Some(state) => {
-                let token = CsrfToken::new(state.to_string());
-                if token.secret() != csrf_token.secret() {
-                    bail!("received state {}, expected: {:?}", state, &csrf_token);
-                }
-            }
-            None => bail!("no state in query parameters: {:?}", params),
-        };
-
-        // Get the code from the parameters
-        let code = match params.get("code") {
-            Some(code) => code.to_string(),
-            None => bail!("no code in query parameters: {:?}", params),
-        };
-
-        // Now you can exchange it for an access token and ID token.
-        let token_response = client
-            .exchange_code(AuthorizationCode::new(code))
-            // Set the PKCE code verifier.
-            .set_pkce_verifier(pkce_verifier)
-            .request(http_client)
-            .context("exchange code for token")?;
-
-        // Extract the ID token claims after verifying its authenticity and nonce.
-        let id_token = token_response
-            .id_token()
-            .unwrap()
-            .claims(&client.id_token_verifier(), &nonce)?;
-
-        // Verify the access token hash to ensure that the access token hasn't been substituted for
-        // another user's.
-        if let Some(expected_access_token_hash) = id_token.access_token_hash() {
-            let actual_access_token_hash = AccessTokenHash::from_token(
-                token_response.access_token(),
-                &token_response.id_token().unwrap().signing_alg()?,
-            )?;
-            if actual_access_token_hash != *expected_access_token_hash {
-                return Err(failure::Error::from_boxed_compat(
-                    "Invalid access token".into(),
-                ));
-            }
+    impl AccessCredentials {
+        /// Derive the WebID from the IdToken claim
+        pub fn webid(&self) -> WebID {
+            // TODO: Derive a WebID URI from the id_token as described at https://github.com/solid/webid-oidc-spec/blob/0e6da67a624a4d09ab85e28bafe85da33f860a61/README.md#deriving-webid-uri-from-id-token
+            self.id_token_claims.subject().to_string()
         }
-
-        // The authenticated user's identity is now available. See the IdTokenClaims struct for a
-        // complete listing of the available claims.
-        println!(
-            "User {} with e-mail address {} has authenticated successfully",
-            id_token.subject().as_str(),
-            id_token
-                .email()
-                .map(|email| email.as_str())
-                .unwrap_or("<not provided>"),
-        );
-
-        // TODO: Derive WebID URI from IT Token as described at
-        // https://github.com/solid/webid-oidc-spec/blob/0e6da67a624a4d09ab85e28bafe85da33f860a61/README.md#deriving-webid-uri-from-id-token
-
-        let access_token = token_response.access_token();
-        let _token_type = token_response.token_type();
-        let _scopes = token_response.scopes();
-        let _refresh_token = token_response.refresh_token();
-        let _expires_in = token_response.expires_in();
-        // See the OAuth2TokenResponse trait for a listing of other available fields such as
-        // access_token() and refresh_token().
-
-        Ok(access_token.clone())
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+    /// Client for talking to one WebIdOIDC provider and can handles multiple users' access credentials.
+    pub struct Client {
+        registration: Registration,
+        oidc_client: openidconnect::core::CoreClient,
+        access_tokens: HashMap<WebID, AccessCredentials>,
+    }
+
+    impl Client {
+        /// Initiates an interactive login to the given provider
+        pub fn login(
+            provider_url: ProviderID,
+            scopes: Vec<String>,
+            callback_bind_addr: String,
+        ) -> Result<Self> {
+            let provider_metadata = Self::discover(provider_url.clone())
+                .context(format!("discover provider {}", &provider_url))?;
+
+            let registration = {
+                let redirect_url = format!("http://{}", callback_bind_addr);
+                let registration_credentials = Self::register(&provider_metadata, &redirect_url)
+                    .context(format!("registration with provider {}", &provider_url))?;
+
+                Registration {
+                    provider: Provider {
+                        id: provider_url,
+                        metadata: provider_metadata,
+                    },
+                    credentials: registration_credentials,
+                    redirect_url,
+                }
+            };
+
+            // Create an OpenID Connect client by specifying the client ID, client secret, authorization URL
+            // and token URL.
+            let oidc_client = CoreClient::from_provider_metadata(
+                registration.provider.metadata.clone(),
+                ClientId::new(registration.credentials.client_id.clone()),
+                Some(ClientSecret::new(
+                    registration.credentials.client_secret.clone(),
+                )),
+            )
+            // Set the URL the user will be redirected to after the authorization process.
+            .set_redirect_uri(
+                openidconnect::RedirectUrl::new(registration.redirect_url.clone())
+                    .context("setting redirect url")?,
+            );
+
+            let query_params_rx_channel =
+                Self::spawn_callback_server(callback_bind_addr.clone())
+                    .context(format!("spawn callback server on {}", callback_bind_addr))?;
+
+            let credentials = Self::authorize(
+                &oidc_client,
+                scopes.into_iter().map(Scope::new).collect(),
+                |url| -> Fallible<_> {
+                    println!("Please browse to: {}", url);
+
+                    // Once the user has authorized the request, we'll receive the query parameters from the background server
+                    let query_params = query_params_rx_channel.recv().context("receiving query_params")?;
+
+                    println!("received query_string");
+
+                    Ok(
+                        actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(&query_params)
+                        .map_err(|e|failure::err_msg(e.to_string()))?
+                        .into_inner()
+                    )
+                }
+            )
+            .context("authorization")?;
+
+            let access_tokens = vec![("TODO: some ressource id here".to_string(), credentials)]
+                .into_iter()
+                .collect::<HashMap<WebID, AccessCredentials>>();
+
+            Ok(Client {
+                registration,
+                oidc_client,
+                access_tokens,
+            })
+        }
 
         fn spawn_callback_server(bind_addr: String) -> Fallible<std::sync::mpsc::Receiver<String>> {
             use actix_web::{web, App, HttpServer, Responder};
+            use std::sync::{mpsc, Mutex};
 
-            let (tx_server, rx_server) = std::sync::mpsc::channel();
-            let (tx_request, rx_request) = std::sync::mpsc::channel::<String>();
+            let (tx_server, rx_server) = mpsc::channel();
+            let (tx_request, rx_request) = mpsc::channel::<String>();
 
-            struct AppData(pub std::sync::mpsc::Sender<String>);
-            let app_data = web::Data::new(std::sync::Mutex::new(AppData(tx_request)));
+            struct AppData(pub mpsc::Sender<String>);
+            let app_data = web::Data::new(Mutex::new(AppData(tx_request)));
 
             async fn index(
-                state: web::Data<std::sync::Mutex<AppData>>,
+                state: web::Data<Mutex<AppData>>,
                 req: web::HttpRequest,
             ) -> impl Responder {
                 println!(
                     "processing incoming request on {}",
-                    &req.headers().get("host").unwrap().to_str().unwrap()
+                    &req.headers()
+                        .get("host")
+                        // TODO: remove unwrap
+                        .unwrap()
+                        .to_str()
+                        // TODO: remove unwrap
+                        .unwrap()
                 );
 
                 let query_string = req.query_string().to_string();
-                state.lock().unwrap().0.send(query_string).unwrap();
+                state
+                    .lock()
+                    // TODO: remove unwrap
+                    .unwrap()
+                    .0
+                    .send(query_string)
+                    // TODO: remove unwrap
+                    .unwrap();
 
                 "Ok".to_string()
             }
@@ -229,6 +185,7 @@ pub mod webid_oidc {
                 })
                 .bind(&bind_addr)
                 .context(format!("binding server to {}", &bind_addr))
+                // TODO: remove unwrap
                 .unwrap()
                 .shutdown_timeout(0)
                 .start();
@@ -245,33 +202,200 @@ pub mod webid_oidc {
             Ok(rx_request)
         }
 
+        fn discover(provider_url: ProviderID) -> Result<ProviderMetadata> {
+            Ok(
+                CoreProviderMetadata::discover(&IssuerUrl::new(provider_url)?, http_client)
+                    .context("provider metadata discovery")?,
+            )
+        }
+
+        fn register(
+            provider_metadata: &CoreProviderMetadata,
+            redirect_url: &str,
+        ) -> Result<RegistrationCredentials> {
+            let registration = CoreClientRegistrationRequest::new(
+                vec![openidconnect::RedirectUrl::new(redirect_url.to_string())?],
+                EmptyAdditionalClientMetadata::default(),
+            );
+
+            let registration_url = provider_metadata
+                .registration_endpoint()
+                // TODO: remove unwrap
+                .unwrap()
+                .to_string();
+
+            let response = registration
+                .register(
+                    &RegistrationUrl::new(registration_url.clone())
+                        .context("new registration url")?,
+                    http_client,
+                )
+                .context(format!("registration at {}", &registration_url))?;
+
+            Ok(RegistrationCredentials {
+                client_id: response.client_id().as_str().to_string(),
+                client_secret: response
+                    .client_secret()
+                    // TODO: remove unwrap
+                    .unwrap()
+                    .secret()
+                    .to_string(),
+            })
+        }
+
+        fn authorize<F>(
+            oidc_client: &CoreClient,
+            requested_scopes: HashSet<Scope>,
+            auth_callback_values_fn: F,
+        ) -> Result<AccessCredentials>
+        where
+            F: FnOnce(&url::Url) -> Fallible<HashMap<String, String>>,
+        {
+            // Generate a PKCE challenge.
+            let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+            // Generate the full authorization URL.
+            let (auth_url, csrf_token, nonce) = {
+                let authorization_request = oidc_client
+                    .authorize_url(
+                        AuthenticationFlow::<CoreResponseType>::Hybrid(vec![
+                            openidconnect::core::CoreResponseType::Code,
+                            // TODO: this currently causes the response to not contain `state`. research if we need this at all, as the procedure seems fine without it.
+                            // openidconnect::core::CoreResponseType::IdToken,
+                        ]),
+                        CsrfToken::new_random,
+                        Nonce::new_random,
+                    )
+                    .set_pkce_challenge(pkce_challenge);
+
+                &requested_scopes
+                    .iter()
+                    .cloned()
+                    .fold(
+                        authorization_request,
+                        |final_authorization_request, scope| {
+                            final_authorization_request.add_scope(scope)
+                        },
+                    )
+                    .url()
+            };
+
+            // Pass the auth_url to the caller and wait for the callback values.
+            let code = auth_callback_values_fn(auth_url)
+                .and_then(|callback_values| {
+                    // For security reasons, verify that the `state` parameter
+                    // returned by the server matches `csrf_state`.
+                    match callback_values.get("state") {
+                        Some(state) => {
+                            let token = CsrfToken::new(state.to_string());
+                            if token.secret() != csrf_token.secret() {
+                                bail!("received state {}, expected: {:?}", state, &csrf_token);
+                            }
+                        }
+                        None => bail!("no state in callback values: {:?}", callback_values),
+                    };
+
+                    callback_values
+                        .get("code")
+                        .ok_or_else(|| {
+                            failure::err_msg(format!(
+                                "no code in callback values: {:?}",
+                                callback_values
+                            ))
+                        })
+                        .map(Into::<String>::into)
+                })
+                .context("receiving callback values")?;
+
+            // Exchange the code for an access token and ID token.
+            let token_response = oidc_client
+                .exchange_code(AuthorizationCode::new(code))
+                .set_pkce_verifier(pkce_verifier)
+                .request(http_client)
+                .context("exchange code for token")?;
+
+            // Verify the authenticity and nonce of the access token and the ID
+            // token claims.
+            let (access_token, id_token_claims) = token_response
+                .id_token()
+                .ok_or_else(|| failure::err_msg("no id_token in response"))
+                .and_then(|id_token| {
+                    let access_token = token_response.access_token();
+
+                    // The authenticated user's identity is now available. See
+                    // the IdTokenClaims struct for a complete listing of the
+                    // available claims.
+                    let id_token_claims = id_token
+                        .claims(&oidc_client.id_token_verifier(), nonce)
+                        .map_err(failure::Error::from)
+                        .and_then(|id_token_claims| {
+                            // Verify the access token hash to ensure that the
+                            // access token hasn't been substituted for another
+                            // user's.
+                            if let Some(expected_access_token_hash) =
+                                id_token_claims.access_token_hash()
+                            {
+                                let actual_access_token_hash = AccessTokenHash::from_token(
+                                    access_token,
+                                    &id_token.signing_alg()?,
+                                )?;
+                                if actual_access_token_hash != *expected_access_token_hash {
+                                    bail!("Invalid access token");
+                                }
+                            }
+
+                            Ok(id_token_claims)
+                        })?;
+
+                    Ok((access_token.clone(), id_token_claims.clone()))
+                })?;
+
+            // Verify which scopes given in the response https://tools.ietf.org/html/rfc6749#section-3.3.
+            let authorized_scopes = token_response.scopes().map(|authorized_scopes| {
+                let authorized_scopes = authorized_scopes
+                    .iter()
+                    .cloned()
+                    // Convert to a HashSet for efficient comparison
+                    .collect::<HashSet<_>>();
+
+                if authorized_scopes != requested_scopes {
+                    eprintln!(
+                        "requested scopes {:?} but was authorized is for {:?}",
+                        requested_scopes, authorized_scopes,
+                    )
+                };
+
+                authorized_scopes
+            });
+
+            // TODO: possibly include these?
+            // TODO: See the OAuth2TokenResponse trait for a listing of other available fields such as
+            let _token_type = token_response.token_type();
+            let _refresh_token = token_response.refresh_token();
+            let _expires_in = token_response.expires_in();
+
+            Ok(AccessCredentials {
+                access_token,
+                id_token_claims,
+                authorized_scopes,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
         #[test]
         #[cfg(feature = "test-net")]
         #[cfg(feature = "test-interactive")]
-        fn login_to_solid_community() -> Result<()> {
-            let bind_addr = String::from("127.0.0.1:36666");
+        fn interactive_login_to_solid_community() -> Result<()> {
+            let callback_bind_addr = String::from("127.0.0.1:36666");
 
-            let callback_uri = format!("http://{}", bind_addr);
             let provider_url = "https://solid.community".to_string();
-            let issuer_url = "https://solid.community".to_string();
-            let scopes = vec!["read".to_string(), "write".to_string()];
+            let scopes = vec!["profile".to_string(), "email".to_string()];
 
-            let rx_query_params = spawn_callback_server(bind_addr)?;
-
-            let (client_id, client_secret) =
-                register(provider_url.clone(), vec![callback_uri.clone()])
-                    .context("registration call in test")?;
-
-            let login_options = LoginOptions {
-                issuer_url,
-                callback_uri,
-                client_id,
-                client_secret,
-                rx_query_params,
-                scopes,
-            };
-
-            let _ = login(login_options).context("test login").unwrap();
+            let _ = Client::login(provider_url, scopes, callback_bind_addr).unwrap();
 
             Ok(())
         }
