@@ -1,35 +1,52 @@
+use failure::Fallible;
+use serde::{de::DeserializeOwned, Serialize};
+
+pub trait AuthenticatedClient<T, LoginOptions, S>: crate::Client<S>
+where
+    S: Serialize + DeserializeOwned,
+{
+    fn login(login_options: LoginOptions) -> Fallible<T>;
+}
+
 /// This module implements the WebID-OIDC protocol
 pub mod webid_oidc {
+    use crate::auth::AuthenticatedClient;
+    use crate::ProviderID;
     use failure::{bail, Fallible, ResultExt};
     use openidconnect::core::{
         CoreClient, CoreClientRegistrationRequest, CoreProviderMetadata, CoreResponseType,
     };
     use openidconnect::registration::EmptyAdditionalClientMetadata;
-    use openidconnect::reqwest::http_client;
+    use openidconnect::reqwest::http_client as oidc_http_client;
     use openidconnect::{
         AccessToken, AccessTokenHash, AuthenticationFlow, AuthorizationCode, ClientId,
         ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
         RegistrationUrl, Scope, TokenResponse,
     };
+    use serde::{Deserialize, Serialize};
+    use std::convert::TryInto;
+    use std::sync::mpsc::Receiver;
+    use std::sync::mpsc::Sender;
 
     use std::collections::{HashMap, HashSet};
 
     type Result<T> = Fallible<T>;
 
-    pub type ProviderID = String;
-
     pub type ProviderMetadata = CoreProviderMetadata;
 
+    #[derive(Serialize, Deserialize)]
     pub struct Provider {
         id: ProviderID,
         metadata: ProviderMetadata,
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct RegistrationCredentials {
         client_id: String,
         client_secret: String,
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct Registration {
         provider: Provider,
         credentials: RegistrationCredentials,
@@ -38,8 +55,17 @@ pub mod webid_oidc {
         redirect_url: String,
     }
 
+    impl TryInto<openidconnect::core::CoreClient> for &Registration {
+        type Error = failure::Error;
+
+        fn try_into(self) -> Fallible<openidconnect::core::CoreClient> {
+            unimplemented!()
+        }
+    }
+
     pub type WebID = String;
 
+    #[derive(Serialize, Deserialize)]
     pub struct AccessCredentials {
         access_token: AccessToken,
         id_token_claims: openidconnect::IdTokenClaims<
@@ -57,35 +83,45 @@ pub mod webid_oidc {
         }
     }
 
-    /// Client for talking to one WebIdOIDC provider and can handles multiple users' access credentials.
+    /// Client for talking to one WebIdOIDC provider and on behalf of multiple users.
     pub struct Client {
+        oidc_client: Option<openidconnect::core::CoreClient>,
+        state: ClientState,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct ClientState {
         registration: Registration,
-        oidc_client: openidconnect::core::CoreClient,
         access_tokens: HashMap<WebID, AccessCredentials>,
     }
 
-    impl Client {
-        /// Initiates an interactive login to the given provider
-        pub fn login(
-            provider_url: ProviderID,
-            scopes: Vec<String>,
-            callback_bind_addr: String,
-        ) -> Result<Self> {
-            let provider_metadata = Self::discover(provider_url.clone())
-                .context(format!("discover provider {}", &provider_url))?;
+    pub struct LoginOptions {
+        provider_url: ProviderID,
+        scopes: Vec<String>,
+        callback_url: url::Url,
+        authorize_url_sender: Sender<url::Url>,
+        callback_values_receiver: Receiver<callback_server::CallbackValues>,
+    }
+
+    impl AuthenticatedClient<Client, LoginOptions, ClientState> for Client {
+        /// Initiates a (by default) interactive login to the given provider
+        fn login(login_options: LoginOptions) -> Result<Self> {
+            let provider_metadata = Self::discover(login_options.provider_url.clone())
+                .context(format!("discover provider {}", &login_options.provider_url))?;
 
             let registration = {
-                let redirect_url = format!("http://{}", callback_bind_addr);
-                let registration_credentials = Self::register(&provider_metadata, &redirect_url)
-                    .context(format!("registration with provider {}", &provider_url))?;
+                let registration_credentials =
+                    Self::register(&provider_metadata, &login_options.callback_url).context(
+                        format!("registration with provider {}", &login_options.provider_url),
+                    )?;
 
                 Registration {
                     provider: Provider {
-                        id: provider_url,
+                        id: login_options.provider_url,
                         metadata: provider_metadata,
                     },
                     credentials: registration_credentials,
-                    redirect_url,
+                    redirect_url: login_options.callback_url.to_string(),
                 }
             };
 
@@ -104,27 +140,11 @@ pub mod webid_oidc {
                     .context("setting redirect url")?,
             );
 
-            let query_params_rx_channel =
-                Self::spawn_callback_server(callback_bind_addr.clone())
-                    .context(format!("spawn callback server on {}", callback_bind_addr))?;
-
             let credentials = Self::authorize(
                 &oidc_client,
-                scopes.into_iter().map(Scope::new).collect(),
-                |url| -> Fallible<_> {
-                    println!("Please browse to: {}", url);
-
-                    // Once the user has authorized the request, we'll receive the query parameters from the background server
-                    let query_params = query_params_rx_channel.recv().context("receiving query_params")?;
-
-                    println!("received query_string");
-
-                    Ok(
-                        actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(&query_params)
-                        .map_err(|e|failure::err_msg(e.to_string()))?
-                        .into_inner()
-                    )
-                }
+                login_options.scopes.into_iter().map(Scope::new).collect(),
+                login_options.authorize_url_sender,
+                login_options.callback_values_receiver,
             )
             .context("authorization")?;
 
@@ -133,85 +153,46 @@ pub mod webid_oidc {
                 .collect::<HashMap<WebID, AccessCredentials>>();
 
             Ok(Client {
-                registration,
-                oidc_client,
-                access_tokens,
+                oidc_client: Some(oidc_client),
+                state: ClientState {
+                    registration,
+                    access_tokens,
+                },
             })
         }
+    }
 
-        fn spawn_callback_server(bind_addr: String) -> Fallible<std::sync::mpsc::Receiver<String>> {
-            use actix_web::{web, App, HttpServer, Responder};
-            use std::sync::{mpsc, Mutex};
+    impl crate::Client<ClientState> for Client {
+        /// Get the Client's ProviderId.
+        fn provider_id(&self) -> &ProviderID {
+            &self.state.registration.provider.id
+        }
 
-            let (tx_server, rx_server) = mpsc::channel();
-            let (tx_request, rx_request) = mpsc::channel::<String>();
+        fn state(&self) -> &ClientState {
+            &self.state
+        }
+    }
 
-            struct AppData(pub mpsc::Sender<String>);
-            let app_data = web::Data::new(Mutex::new(AppData(tx_request)));
+    impl Client {
+        pub fn from_state(state: ClientState) -> Result<Self> {
+            let client = Client {
+                oidc_client: Some((&state.registration).try_into()?),
+                state,
+            };
 
-            async fn index(
-                state: web::Data<Mutex<AppData>>,
-                req: web::HttpRequest,
-            ) -> impl Responder {
-                println!(
-                    "processing incoming request on {}",
-                    &req.headers()
-                        .get("host")
-                        // TODO: remove unwrap
-                        .unwrap()
-                        .to_str()
-                        // TODO: remove unwrap
-                        .unwrap()
-                );
-
-                let query_string = req.query_string().to_string();
-                state
-                    .lock()
-                    // TODO: remove unwrap
-                    .unwrap()
-                    .0
-                    .send(query_string)
-                    // TODO: remove unwrap
-                    .unwrap();
-
-                "Ok".to_string()
-            }
-
-            std::thread::spawn(move || {
-                let sys = actix_rt::System::new("callback-server");
-
-                let server = HttpServer::new(move || {
-                    App::new().service(web::resource("/").to(index).register_data(app_data.clone()))
-                })
-                .bind(&bind_addr)
-                .context(format!("binding server to {}", &bind_addr))
-                // TODO: remove unwrap
-                .unwrap()
-                .shutdown_timeout(0)
-                .start();
-
-                println!("started server");
-
-                let _ = tx_server.send(server);
-                let _ = sys.run();
-            });
-
-            let _ = rx_server.recv().context("receiving addr")?;
-            println!("callback server spawned");
-
-            Ok(rx_request)
+            Ok(client)
         }
 
         fn discover(provider_url: ProviderID) -> Result<ProviderMetadata> {
             Ok(
-                CoreProviderMetadata::discover(&IssuerUrl::new(provider_url)?, http_client)
+                CoreProviderMetadata::discover(&IssuerUrl::new(provider_url)?, oidc_http_client)
                     .context("provider metadata discovery")?,
             )
         }
 
         fn register(
             provider_metadata: &CoreProviderMetadata,
-            redirect_url: &str,
+            redirect_url: &url::Url,
         ) -> Result<RegistrationCredentials> {
             let registration = CoreClientRegistrationRequest::new(
                 vec![openidconnect::RedirectUrl::new(redirect_url.to_string())?],
@@ -228,7 +209,7 @@ pub mod webid_oidc {
                 .register(
                     &RegistrationUrl::new(registration_url.clone())
                         .context("new registration url")?,
-                    http_client,
+                    oidc_http_client,
                 )
                 .context(format!("registration at {}", &registration_url))?;
 
@@ -243,14 +224,12 @@ pub mod webid_oidc {
             })
         }
 
-        fn authorize<F>(
+        fn authorize(
             oidc_client: &CoreClient,
             requested_scopes: HashSet<Scope>,
-            auth_callback_values_fn: F,
-        ) -> Result<AccessCredentials>
-        where
-            F: FnOnce(&url::Url) -> Fallible<HashMap<String, String>>,
-        {
+            authorize_url_sender: Sender<url::Url>,
+            callback_values_receiver: Receiver<callback_server::CallbackValues>,
+        ) -> Result<AccessCredentials> {
             // Generate a PKCE challenge.
             let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -280,8 +259,15 @@ pub mod webid_oidc {
                     .url()
             };
 
-            // Pass the auth_url to the caller and wait for the callback values.
-            let code = auth_callback_values_fn(auth_url)
+            // Pass the auth_url to the caller.
+            authorize_url_sender.send(auth_url.clone())?;
+
+            eprintln!("[Client::login] sent authorize url {}", &auth_url);
+
+            // Wait for the callback values.
+            let code = callback_values_receiver
+                .recv()
+                .map_err(failure::Error::from)
                 .and_then(|callback_values| {
                     // For security reasons, verify that the `state` parameter
                     // returned by the server matches `csrf_state`.
@@ -311,7 +297,7 @@ pub mod webid_oidc {
             let token_response = oidc_client
                 .exchange_code(AuthorizationCode::new(code))
                 .set_pkce_verifier(pkce_verifier)
-                .request(http_client)
+                .request(oidc_http_client)
                 .context("exchange code for token")?;
 
             // Verify the authenticity and nonce of the access token and the ID
@@ -360,7 +346,7 @@ pub mod webid_oidc {
 
                 if authorized_scopes != requested_scopes {
                     eprintln!(
-                        "requested scopes {:?} but was authorized is for {:?}",
+                        "[Client::login] [WARNING] requested scopes {:?} but was authorized is for {:?}",
                         requested_scopes, authorized_scopes,
                     )
                 };
@@ -382,22 +368,333 @@ pub mod webid_oidc {
         }
     }
 
+    pub mod callback_server {
+        use super::*;
+        use actix_web::{web, App, HttpServer, Responder};
+        use std::str::FromStr;
+        use std::sync::Mutex;
+
+        pub struct CallbackServer {
+            bind_addr: String,
+            url: url::Url,
+            callback_values_sender: Sender<CallbackValues>,
+            server: Option<actix_server::Server>,
+        }
+
+        impl CallbackServer {
+            pub fn url(&self) -> &url::Url {
+                &self.url
+            }
+
+            pub fn try_new(
+                bind_addr: String,
+                callback_values_sender: Sender<CallbackValues>,
+            ) -> Fallible<Self> {
+                Ok(Self {
+                    url: url::Url::from_str(&format!("http://{}", &bind_addr))?,
+                    bind_addr,
+                    callback_values_sender,
+                    server: None,
+                })
+            }
+
+            pub fn spawn(&mut self) -> Fallible<()> {
+                if self.server.is_some() {
+                    bail!("server is already running")
+                }
+
+                let (tx_server, rx_server) = std::sync::mpsc::channel();
+                {
+                    let bind_addr = self.bind_addr.clone();
+
+                    let app_data = web::Data::new(Mutex::new(self.callback_values_sender.clone()));
+
+                    std::thread::spawn(move || -> ! {
+                        let sys = actix_rt::System::new("callback-server");
+
+                        let server = HttpServer::new(move || {
+                            App::new()
+                                .register_data(app_data.clone())
+                                .service(web::resource("/").to(Self::index))
+                        })
+                        .bind(&bind_addr)
+                        .context(format!("binding addr  {}", &bind_addr))
+                        .unwrap()
+                        .shutdown_timeout(0)
+                        .start();
+
+                        tx_server.send(server).unwrap();
+                        sys.run().unwrap();
+                        unreachable!();
+                    });
+                }
+
+                self.server = Some(
+                    rx_server
+                        .recv()
+                        .context("receiving server from other thread")?,
+                );
+
+                eprintln!(
+                    "[CallbackServer::spawn] started server on {}",
+                    &self.bind_addr
+                );
+
+                Ok(())
+            }
+
+            /// This function processes each request which is received on `/` in the callback server.
+            async fn index(
+                state: web::Data<Mutex<Sender<CallbackValues>>>,
+                req: web::HttpRequest,
+            ) -> impl Responder {
+                let responder = || -> Fallible<_> {
+                    eprintln!(
+                        "[CallbackServer::index] processing incoming request: {} {}",
+                        &req.method(),
+                        &req.path(),
+                    );
+
+                    let query_string = req.query_string().to_string();
+
+                    let callback_values = actix_web::web::Query::<
+                        std::collections::HashMap<String, String>,
+                    >::from_query(&query_string)
+                    .map_err(|e| failure::err_msg(e.to_string()))?
+                    .into_inner();
+
+                    state
+                        .lock()
+                        .map_err(|e| failure::err_msg(format!("could not acquire lock: {}", e)))?
+                        .send(callback_values)
+                        .unwrap_or_else(|e| {
+                            println!(
+                            "[CallbackServer::index] [ERROR] could not send values to backend: {}",
+                            e
+                        )
+                        });
+
+                    Ok("Ok"
+                        .to_string()
+                        .with_status(actix_web::http::StatusCode::OK))
+                };
+
+                match responder() {
+                    Ok(ok) => ok,
+                    Err(e) => e
+                        .to_string()
+                        .with_status(actix_web::http::StatusCode::BAD_REQUEST),
+                }
+            }
+        }
+
+        pub(crate) type CallbackValues = HashMap<String, String>;
+
+        pub(crate) struct LoginChannels {
+            pub(crate) authorize_url_sender: Sender<url::Url>,
+            pub(crate) authorize_url_receiver: Receiver<url::Url>,
+
+            pub(crate) callback_values_sender: Sender<CallbackValues>,
+            pub(crate) callback_values_receiver: Receiver<CallbackValues>,
+        }
+
+        impl Default for LoginChannels {
+            fn default() -> Self {
+                use std::sync::mpsc::channel;
+                let callback_url_channel = channel::<url::Url>();
+                let callback_values_channel = channel::<CallbackValues>();
+
+                LoginChannels {
+                    authorize_url_sender: callback_url_channel.0,
+                    authorize_url_receiver: callback_url_channel.1,
+
+                    callback_values_sender: callback_values_channel.0,
+                    callback_values_receiver: callback_values_channel.1,
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
         #[test]
         #[cfg(feature = "test-net")]
-        #[cfg(feature = "test-interactive")]
-        fn interactive_login_to_solid_community() -> Result<()> {
-            let callback_bind_addr = String::from("127.0.0.1:36666");
-
-            let provider_url = "https://solid.community".to_string();
+        fn login_to_provider() -> Result<()> {
+            let provider_url = std::env::var("SOLID_PROVIDER")
+                .context("expecting solid provider URL in SOLID_PROVIDER")?;
             let scopes = vec!["profile".to_string(), "email".to_string()];
+            let bind_addr = "127.0.0.1:36666".to_string();
 
-            let _ = Client::login(provider_url, scopes, callback_bind_addr).unwrap();
+            let login_channels = callback_server::LoginChannels::default();
+
+            let mut callback_server = callback_server::CallbackServer::try_new(
+                bind_addr,
+                login_channels.callback_values_sender,
+            )?;
+            callback_server.spawn()?;
+
+            let relyingparty = {
+                let authorize_url_sender = login_channels.authorize_url_sender;
+                let callback_values_receiver = login_channels.callback_values_receiver;
+                let callback_server_url = callback_server.url().clone();
+
+                std::thread::spawn(move || -> Fallible<_> {
+                    // TODO: ensure we're not already authorized
+
+                    let _ = Client::login(LoginOptions {
+                        provider_url,
+                        scopes,
+                        callback_url: callback_server_url,
+                        authorize_url_sender,
+                        callback_values_receiver,
+                    })?;
+
+                    // TODO: verify we're actually authorized
+
+                    Ok(())
+                })
+            };
+
+            let frontend = {
+                let authorize_url_receiver = login_channels.authorize_url_receiver;
+
+                std::thread::spawn(move || -> Fallible<_> {
+                    let authorize_url = authorize_url_receiver.recv().unwrap();
+
+                    automate_login(authorize_url)
+                })
+            };
+
+            let _ = frontend.join().unwrap();
+            let _ = relyingparty.join().unwrap();
 
             Ok(())
+        }
+
+        /// log in and authorize the request
+        #[cfg(feature = "test-net")]
+        fn automate_login(authorize_url: url::Url) -> Fallible<()> {
+            eprintln!("[TEST] got authorize url {}", authorize_url);
+
+            let query_pairs = authorize_url
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<String, String>>();
+
+            let base_url = format!(
+                "{}://{}",
+                authorize_url.scheme(),
+                authorize_url.host_str().unwrap()
+            );
+
+            // TODO: use a macro for this
+            let scope = query_pairs.get("scope").unwrap();
+            let client_id = query_pairs.get("client_id").unwrap();
+            let nonce = query_pairs.get("nonce").unwrap();
+            let redirect_uri = query_pairs.get("redirect_uri").unwrap();
+            let response_type = query_pairs.get("response_type").unwrap();
+            let state = query_pairs.get("state").unwrap();
+
+            let http_client: reqwest::blocking::Client = reqwest::blocking::ClientBuilder::new()
+                .cookie_store(true)
+                .timeout(std::time::Duration::from_secs(5))
+                // .redirect(reqwest::RedirectPolicy::none())
+                .redirect(reqwest::RedirectPolicy::limited(10))
+                .build()?;
+
+            // GET to authorize endpoint
+            let authorize_response = http_client.get(authorize_url.as_str()).send()?;
+            assert_eq!(
+                authorize_response.status(),
+                reqwest::StatusCode::OK,
+                "response: {:#?}",
+                authorize_response
+            );
+
+            // POST to /password
+            let password_response = http_client
+                .post(&format!("{}/login/password", base_url))
+                .form(&[
+                    // POST
+                    // curl 'https://solid.community/login/password' --data '
+                    // username=user
+                    (
+                        "username",
+                        &std::env::var("SOLID_USERNAME")
+                            .context("expecting solid username URL in SOLID_USERNAME")?,
+                    ),
+                    // &password=1243
+                    (
+                        "password",
+                        &std::env::var("SOLID_PASSWORD")
+                            .context("expecting solid password URL in SOLID_PASSWORD")?,
+                    ),
+                    // &response_type=code
+                    ("response_type", response_type),
+                    // &scope=openid+profile+email
+                    ("scope", scope),
+                    // &client_id=c6058f0d487151d7672373ace012c6b1
+                    ("client_id", client_id),
+                    // &state=EPnM_4kOajd1AP0jsdC7GA&nonce=ytGeLk9GIU9BAMpk7ws7NA
+                    ("state", state),
+                    // &redirect_uri=http%3A%2F%2F127.0.0.1%3A36667%2F
+                    ("redirect_uri", redirect_uri),
+                    // &nonce=ytGeLk9GIU9BAMpk7ws7NA&request='
+                    ("nonce", nonce),
+                    // &request=
+                    // &display=
+                ])
+                .send()?;
+
+            assert_eq!(
+                password_response.status(),
+                reqwest::StatusCode::OK,
+                "response: {:#?}",
+                password_response
+            );
+
+            if password_response.url().to_string().contains("code") {
+                eprintln!("[TEST] Resource has been previously shared");
+
+                Ok(())
+            } else {
+                // POST to /share
+                let sharing_response = http_client
+                    .post(&format!("{}/sharing", base_url))
+                    .form(&[
+                        // POST
+                        // curl 'https://solid.community/sharing' --data '
+                        // access_mode=Read
+                        ("access_mode", "Read"),
+                        // &consent=true
+                        ("consent", "true"),
+                        // &response_type=code
+                        ("response_type", response_type),
+                        // &display=
+                        // &scope=openid+profile+email
+                        ("scope", scope),
+                        // &client_id=c6058f0d487151d7672373ace012c6b1
+                        ("client_id", client_id),
+                        // &redirect_uri=http%3A%2F%2F127.0.0.1%3A36667%2F
+                        ("redirect_uri", redirect_uri),
+                        // &nonce=ytGeLk9GIU9BAMpk7ws7NA&request='
+                        ("nonce", nonce),
+                        // &state=EPnM_4kOajd1AP0jsdC7GA
+                        ("state", state),
+                    ])
+                    .send()?;
+                assert_eq!(
+                    sharing_response.status().clone(),
+                    reqwest::StatusCode::OK,
+                    "response: with text: '{}'",
+                    // &sharing_response,
+                    sharing_response.text()?,
+                );
+
+                Ok(())
+            }
         }
     }
 }
