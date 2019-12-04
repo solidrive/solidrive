@@ -29,12 +29,10 @@ Maybe
 [solid-websocket-api]: https://github.com/solid/solid-spec/blob/master/api-websockets.md
 
 ## Tests
-To run all tests in the library it is currently recommended to use the following command:
+To run all tests in the library it is recommended to use the following command:
 
 ```console
-cargo test --jobs 1 --features test-net,test-interactive -- --nocapture
+cargo test --features test-net
 ```
 
-The reason why we only want to run 1 job at a time is the execution of the interactive tests.
-These depend on the user reading and processing console output, which may be be out of order if multiple tests are run in parallel.
-This is [intended to change in the future](https://github.com/steveeJ/coegi/issues/8).
+The tests rely on network connectivity (to https://solid.community) and user credentials for in the environment (`SOLID_USERNAME` and `SOLID_PASSWORD`).
