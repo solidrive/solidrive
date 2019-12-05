@@ -1,5 +1,5 @@
-# Coegi - Decentralized file synchronization and sharing
-Coegi aims to deliver a decentralized alternative to centralized file synchronization and sharing platforms, such as the proprietary Dropbox and Google Drive, as well as the open-source Nextcloud or ownCloud.
+# SoLiDrive - Decentralized file synchronization and sharing
+SoLiDrive aims to deliver a decentralized alternative to centralized file synchronization and sharing platforms, such as the proprietary Dropbox and Google Drive, as well as the open-source Nextcloud or ownCloud.
 The decentralization aspect is achieved by making use of the specifications and components which are developed by the [SOLID project][solid].
 
 ## General questions
@@ -13,7 +13,7 @@ Libraries (produced and) used:
 
 * [libsolid-rs](libsolid-rs)
 
-## Coegi Mobile (Android/iOS)
+## SoLiDrive Mobile (Android/iOS)
 * Mobile Application for Android/iOS
 
 ### Prerequisites
@@ -47,13 +47,13 @@ Libraries (produced and) used:
 * Publish on F-Droid
 * Party with non-alcoholic beer \o/
 
-## Coegi CLI (Linux/Windows/Mac)
+## SoLiDrive CLI (Linux/Windows/Mac)
 * TODO
 
-## Coegi Website
+## SoLiDrive Website
 * TODO
 
-## Coegi Daemon (Linux/Windows/Mac)
+## SoLiDrive Daemon (Linux/Windows/Mac)
 * TODO
 
 [solid]: https://solid.mit.edu
