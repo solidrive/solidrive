@@ -14,38 +14,7 @@ Libraries (produced and) used:
 * [libsolid-rs](libsolid-rs)
 
 ## SoLiDrive Mobile (Android/iOS)
-* Mobile Application for Android/iOS
-
-### Prerequisites
-* Choose a multi-platform framework which supports calling Rust in the background service
-
-### v0.1
-* Multi-platform App with background service which links to Rust library
-
-### v0.2
-* Login/Authentication
-* List
-* View (download to memory)
-
-### v0.3
-* Download to filesystem
-
-### v0.4
-* Upload files
-* Delete files
-
-### v0.5
-* Un/Share files with permissions
-
-### v0.6
-* File synchronization Upload only mode
-
-### v0.7
-* File synchronization Download
-
-### v1.0
-* Publish on F-Droid
-* Party with non-alcoholic beer \o/
+* [SoLiDrive Android Client][solidrive-android-client]
 
 ## SoLiDrive CLI (Linux/Windows/Mac)
 * TODO
@@ -57,3 +26,4 @@ Libraries (produced and) used:
 * TODO
 
 [solid]: https://solid.mit.edu
+[solidrive-android-client]: https://github.com/solidrive/solidrive-android-client
