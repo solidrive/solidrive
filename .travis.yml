@@ -1,0 +1,12 @@
+language: rust
+cache: cargo
+rust:
+  - stable
+  - beta
+  - nightly
+jobs:
+  allow_failures:
+    - rust: nightly
+  fast_finish: true
+script:
+  - pushd libsolid-rs; cargo test --features test-net
