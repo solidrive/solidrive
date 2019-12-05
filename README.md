@@ -5,9 +5,6 @@ The decentralization aspect is achieved by making use of the specifications and 
 ## What is Solid?
 Solid, which stands for **So**cial **Li**nked **D**ata, is a set of specifications and tools that provides separation between web applications and the data they consume. It allows end-users to have ownership over their data by providing them with the ability to choose where this data is stored and who can access it. 
 
-## General questions
-* Does it make sense to use HTTP3/QUIC for transport?
-
 ## Shared Libraries
 A goal with regard to implementation is to share the implementation of authentication and data transfer among all clients.
 The approach is to build all this functionality in one or several Rust libraries, and find a way to link it in the mobile and desktop applications.
