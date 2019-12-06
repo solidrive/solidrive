@@ -17,6 +17,7 @@ actix-server = "1.0.0-alpha.2"
 url = "2.1"
 serde = "1.0"
 serde_json = "1.0"
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 mktemp = "0.4"
